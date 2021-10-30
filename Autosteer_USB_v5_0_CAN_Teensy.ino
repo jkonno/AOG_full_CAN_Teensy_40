@@ -29,6 +29,7 @@
 
   #include <SPI.h>
   #include <FlexCAN_T4.h>
+  // Configure this to whatever CAN driver you have hooked up CAN1/CAN2 etc
   FlexCAN_T4<CAN1, RX_SIZE_1024, TX_SIZE_1024> Can0;
   
   void readJ1939WAS(CAN_message_t &msg);
@@ -39,7 +40,12 @@
   CAN_message_t wasMessage;
   CAN_message_t keypadMessage;
   
-  // Define WAS, flow, button message ID to match from bus
+  // Define WAS, flow, button message ID to match from bus structure
+  // This stuff works for following config: 
+  // Danfoss DST X510 WAS
+  // Danfoss PVEA-CI CANBUS valve (or any other CAN valve using standard ISOBUS flow commands)
+  // STW M01 J1939 pressure sensor
+  // Blinkmarine PKP-2200-LI keypad
   uint32_t wasMessageID = 0x018FF0B15;
   uint32_t steerSwID = 0x018EFFF21;
   uint32_t pressureMessageID = 0x018FF034E;
@@ -130,7 +136,7 @@
       uint8_t minPWM = 9;
       uint8_t highPWM = 60;//max PWM value
       float steerSensorCounts = 30;        
-      float AckermanFix = 1;     //sent as percent
+      float AckermanFix = 1.0;     //sent as percent
   };  Storage steerSettings;  //14 bytes
 
    //Variables for settings - 0 is false  
@@ -310,10 +316,6 @@
       switchByte |= (steerSwitch << 1);   //put steerswitch status in bit 1 position
       switchByte |= workSwitch;   
       
-      //Ackerman fix
-      if (steerAngleActual < 0) steerAngleActual = (steerAngleActual * steerSettings.AckermanFix);
-           Serial.println(steerAngleActual);
-      
       if (watchdogTimer < WATCHDOG_THRESHOLD)
       {    
         steerAngleError = steerAngleActual - steerAngleSetPoint;   //calculate the steering error
@@ -335,6 +337,24 @@
         Serial.write(helloAgIO,sizeof(helloAgIO));
         helloCounter = 0;
       }
+
+      // Set keypad LED
+      // Steer swith is OFF --> RED
+      if (steerSwitch == 1) { 
+          keypadMessage.buf[4] = 0x01;
+          Can0.write(keypadMessage);
+      } else if (steerSwitch == 0) {
+          if (guidanceStatus == 0) {
+            // Button pressed but guidance off --> YELLOW
+            keypadMessage.buf[4] = 0x04;
+            Can0.write(keypadMessage);
+          } else {
+            // Button pressed, quidance on --> GREEN
+            keypadMessage.buf[4] = 0x02;
+            Can0.write(keypadMessage);
+          }
+      }
+      
     } //end of timed loop
   
     //This runs continuously, not timed //// Serial Receive Data/Settings /////////////////
@@ -507,17 +527,18 @@
         
         steerSettings.highPWM = Serial.read();
         
-        steerSettings.lowPWM = (float)Serial.read();   // read lowPWM from AgOpenGPS
+        steerSettings.lowPWM = Serial.read();   // read lowPWM from AgOpenGPS
                 
         steerSettings.minPWM = Serial.read(); //read the minimum amount of PWM for instant on
         
-        steerSettings.steerSensorCounts = Serial.read(); //sent as setting displayed in AOG
+        steerSettings.steerSensorCounts = (float)Serial.read(); //sent as setting displayed in AOG
         
         steerSettings.wasOffset = (Serial.read());  //read was zero offset Hi
                
         steerSettings.wasOffset |= (Serial.read() << 8);  //read was zero offset Lo
         
-        steerSettings.AckermanFix = (float)Serial.read() * 0.01; 
+        steerSettings.AckermanFix = ((float)(Serial.read()));
+        steerSettings.AckermanFix*=0.01; 
 
         //crc
         //udpData[13];        //crc
@@ -583,8 +604,8 @@
         isHeaderFound = isPGNFound = false;
         pgn=dataLength=0; 
 
-        //reset the arduino
-        setup();
+        //reset the arduino -- not really needed here...
+        //setup();
       }
     
       //clean up strange pgns
@@ -598,6 +619,8 @@
     } //end if (Serial.available() > dataLength && isHeaderFound && isPGNFound)      
     
   } // end of main loop
+
+ // CAN BUS HELPER FUNCTIONS
 
   void writeToBus(CAN_message_t &msg){
     Can0.write(msg);
@@ -618,15 +641,15 @@
         {
           currentState = 0;
           steerSwitch = 0;
-          keypadMessage.buf[4] = 0x02;
-          Can0.write(keypadMessage);
+          //keypadMessage.buf[4] = 0x02;
+          //Can0.write(keypadMessage);
         }
       else
         {
           currentState = 1;
           steerSwitch = 1;
-          keypadMessage.buf[4] = 0x01;
-          Can0.write(keypadMessage);
+          //keypadMessage.buf[4] = 0x01;
+          //Can0.write(keypadMessage);
         }
       }      
       previous = reading;
@@ -634,24 +657,18 @@
     // Pressure sensor message arrives
     else if (msg.id == pressureMessageID) {
       // Check pressure against threshold
-      if (steerConfig.PressureSensor)
-      {
         uint16_t temp = 0;
         temp = (uint16_t) msg.buf[1] << 8;
         temp |= (uint16_t) msg.buf[0];        
         // Scale with 0,004 bar / bit
         int16_t steeringWheelPressureReading = temp * 0.004;
-
         // When the pressure sensor is reading pressure high enough, shut off
         if (steeringWheelPressureReading >= steerConfig.PulseCountMax)
         {
           steerSwitch = 1; // reset values like it turned off
           currentState = 1;
           previous = 0x00;
-          keypadMessage.buf[4] = 0x01;
-          Can0.write(keypadMessage);
         }
-      }
     }
   }
  
@@ -673,6 +690,8 @@
       {
         steeringPosition = (steeringPosition + steerSettings.wasOffset);   // 1/2 of full scale
         steerAngleActual = (float)(steeringPosition) / steerSettings.steerSensorCounts;
-      }       
+      }
+      //Ackerman fix
+      if (steerAngleActual < 0) steerAngleActual = (steerAngleActual * steerSettings.AckermanFix);     
     }
   }
