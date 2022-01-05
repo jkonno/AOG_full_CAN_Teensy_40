@@ -49,8 +49,10 @@
   uint32_t wasMessageID = 0x018FF0B15;
   uint32_t steerSwID = 0x018EFFF21;
   uint32_t pressureMessageID = 0x018FF034E;
+  uint32_t SASAIIDMessageID = 0x0CFF104D;
   uint32_t flowCommandID = 0x0CFE3022;
   uint32_t keypadMessageID = 0x018EF2100;
+  uint16_t oldSteerAngle = 0;
   //End CAN driven valve edit
   
   //loop time variables in microseconds  
@@ -656,7 +658,7 @@
     }
     // Pressure sensor message arrives
     else if (msg.id == pressureMessageID) {
-      // Check pressure against threshold
+        // Check pressure against threshold
         uint16_t temp = 0;
         temp = (uint16_t) msg.buf[1] << 8;
         temp |= (uint16_t) msg.buf[0];        
@@ -668,6 +670,36 @@
           steerSwitch = 1; // reset values like it turned off
           currentState = 1;
           previous = 0x00;
+        }
+    } 
+    // SASAIID sensor message arrives
+    else if (msg.id == SASAIIDMessageID) {
+        // Check steering angle
+        uint16_t tempAngle = 0;
+        tempAngle = (uint16_t) msg.buf[1] << 8;
+        tempAngle |= (uint16_t) msg.buf[0];
+        // Check steering angle velocity
+        uint16_t tempVelocity = 0;
+        tempVelocity = (uint16_t) msg.buf[3] << 8;
+        tempVelocity |= (uint16_t) msg.buf[2];  
+        // Steer velocity in dRPM (20480 is 300 RPM = 3000 dRPM, PVED-CLS limit is 5 dRPM)
+        int16_t steerSpeed = abs((tempVelocity - 20480)*0.146484375);
+        // Steering stationary below 5 dRPM
+        if (steerSpeed < 5) {
+          // Set the stationary angle point
+          oldSteerAngle = tempAngle;
+        } else {
+          uint16_t deltaAngle = abs(tempAngle-oldSteerAngle);
+          if (deltaAngle > 2048) {
+            deltaAngle = 4096 - deltaAngle; // Handle the 0-360 jump
+          }
+          // Disengage if angle exceeds 10 degrees (PVED-CLS recommendation)
+          if (deltaAngle > 10*4096/360) 
+          {
+            steerSwitch = 1; // reset values like it turned off
+            currentState = 1;
+            previous = 0x00;
+          }
         }
     }
   }
