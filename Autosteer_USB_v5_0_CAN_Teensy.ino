@@ -21,11 +21,20 @@
   // BNO08x definitions
   #define REPORT_INTERVAL 90 //Report interval in ms (same as the delay at the bottom)
 
+  //--------------------------- Switch Input Pins ------------------------
+  #define STEERSW_PIN 6 //PD6
+  #define WORKSW_PIN 7  //PD7
+
   #define CONST_180_DIVIDED_BY_PI 57.2957795130823
 
   #include <Wire.h>
   #include <EEPROM.h> 
   #include "BNO08x_AOG.h"
+
+  // Add support for analog WAS
+  #include "zADS1115.h"
+  ADS1115_lite adc(ADS1115_DEFAULT_ADDRESS);     // Use this for the 16-bit version ADS1115
+  bool useAnalogueWAS = true;
 
   #include <SPI.h>
   #include <FlexCAN_T4.h>
@@ -56,7 +65,7 @@
   //End CAN driven valve edit
   
   //loop time variables in microseconds  
-  const uint16_t LOOP_TIME = 20;  //50Hz    
+  const uint16_t LOOP_TIME = 50;  //50Hz    
   uint32_t lastTime = LOOP_TIME;
   uint32_t currentTime = LOOP_TIME;
   
@@ -155,6 +164,7 @@
       uint8_t CurrentSensor = 0;
       uint8_t PulseCountMax = 5;
       uint8_t IsDanfoss = 0; 
+      uint8_t IsUseY_Axis = 0;
   };  Setup steerConfig;          //9 bytes
 
   //reset function
@@ -183,6 +193,11 @@
     flowCommand.id = flowCommandID;
     flowCommand.buf[1] = 0xFF;
     flowCommand.buf[2] = 0xc0;
+    flowCommand.buf[3] = 0xFF;
+    flowCommand.buf[4] = 0xFF;
+    flowCommand.buf[5] = 0xFF;
+    flowCommand.buf[6] = 0xFF;
+    flowCommand.buf[7] = 0xFF;
     flowCommand.flags.extended = 1;
     flowCommand.seq = 1;
 
@@ -201,6 +216,10 @@
     //EDIT FOR CAN VALVE ENDS
 
     Can0.write(keypadMessage);
+
+    // Analog steer sw
+    pinMode(STEERSW_PIN, INPUT_PULLUP);
+    pinMode(WORKSW_PIN, INPUT_PULLUP);
   
     //test if CMPS working
     uint8_t error;
@@ -296,6 +315,9 @@
     // for PWM High to Low interpolator
     highLowPerDeg = ((float)(steerSettings.highPWM - steerSettings.lowPWM)) / LOW_HIGH_DEGREES;
 
+    adc.setSampleRate(ADS1115_REG_CONFIG_DR_128SPS); //128 samples per second
+    adc.setGain(ADS1115_REG_CONFIG_PGA_6_144V);
+
   }// End of Setup
 
   void loop()
@@ -312,19 +334,59 @@
      
       //If connection lost to AgOpenGPS, the watchdog will count up and turn off steering
       if (watchdogTimer++ > 250) watchdogTimer = WATCHDOG_FORCE_VALUE;
+
+      //read all the switches
+      workSwitch = digitalRead(WORKSW_PIN);  // read work switch
+      
+      if (steerConfig.SteerSwitch == 1)         //steer switch on - off
+      {
+        steerSwitch = digitalRead(STEERSW_PIN); //read auto steer enable switch open = 0n closed = Off
+      }
+      else if (steerConfig.SteerButton == 1)    //steer Button momentary
+      {
+        reading = digitalRead(STEERSW_PIN);     
+        if (reading == LOW && previous == HIGH) 
+        {
+          if (currentState == 1)
+          {
+            currentState = 0;
+            steerSwitch = 0;
+          }
+          else
+          {
+            currentState = 1;
+            steerSwitch = 1;
+          }
+        }      
+        previous = reading;
+      }
+      else                                      // No steer switch and no steer button
+      {
+        // So set the correct value. When guidanceStatus = 1, 
+        // it should be on because the button is pressed in the GUI
+        // But the guidancestatus should have set it off first
+        if (guidanceStatus == 1 && steerSwitch == 1 && previous == 0)
+        {
+          steerSwitch = 0;
+          previous = 1;
+        }
+      }
       
       switchByte = 0;
       switchByte |= (remoteSwitch << 2); //put remote in bit 2
       switchByte |= (steerSwitch << 1);   //put steerswitch status in bit 1 position
       switchByte |= workSwitch;   
+
+      // Use analogue WAS reading (as there's no angle message in CANBUS, no need to turn off CAN messages)
+      if (useAnalogueWAS) readADS1115WAS();
       
       if (watchdogTimer < WATCHDOG_THRESHOLD)
       {    
         steerAngleError = steerAngleActual - steerAngleSetPoint;   //calculate the steering error
         //if (abs(steerAngleError)< steerSettings.lowPWM) steerAngleError = 0;
         
-        calcSteeringPID();  //do the pid
-        motorDrive();       //out to motors the pwm value
+       calcSteeringPID();  //do the pid
+       motorDrive();       //out to motors the pwm value
       }
       else
       {                
@@ -470,9 +532,11 @@
             {
               bno08xHeading = bno08xHeading + 360;
             }
-                
-            bno08xRoll = (bno08x.getRoll()) * CONST_180_DIVIDED_BY_PI; //Convert roll to degrees
-            //bno08xPitch = (bno08x.getPitch())* CONST_180_DIVIDED_BY_PI; // Convert pitch to degrees
+
+            if (steerConfig.IsUseY_Axis)
+                bno08xRoll = (bno08x.getPitch())* CONST_180_DIVIDED_BY_PI; // Convert pitch to degrees
+            else
+                bno08xRoll = (bno08x.getRoll()) * CONST_180_DIVIDED_BY_PI; //Convert roll to degrees
     
             bno08xHeading10x = (int16_t)(bno08xHeading * 10);
             bno08xRoll10x = (int16_t)(bno08xRoll * 10);
@@ -590,6 +654,7 @@
         if (bitRead(sett, 0)) steerConfig.IsDanfoss = 1; else steerConfig.IsDanfoss = 0;
         if (bitRead(sett, 1)) steerConfig.PressureSensor = 1; else steerConfig.PressureSensor = 0;
         if (bitRead(sett, 2)) steerConfig.CurrentSensor = 1; else steerConfig.CurrentSensor = 0;
+        if (bitRead(sett, 3)) steerConfig.IsUseY_Axis = 1; else steerConfig.IsUseY_Axis = 0;
               
         Serial.read(); //byte 9
         Serial.read(); //byte 10
@@ -619,7 +684,7 @@
       }        
   
     } //end if (Serial.available() > dataLength && isHeaderFound && isPGNFound)      
-    
+
   } // end of main loop
 
  // CAN BUS HELPER FUNCTIONS
@@ -703,7 +768,7 @@
         }
     }
   }
- 
+  
   void readJ1939WAS(CAN_message_t &msg)
   {
     // Check for correct id
@@ -712,7 +777,7 @@
       temp = (uint16_t) msg.buf[0] << 8;
       temp |= (uint16_t) msg.buf[1];
       steeringPosition = (int)temp;
-      //if (steeringPosition > 1800) steeringPosition = steeringPosition - 3600;
+      if (steeringPosition > 1800) steeringPosition = steeringPosition - 3600;
       if (steerConfig.InvertWAS)
       {
         steeringPosition = (steeringPosition - steerSettings.wasOffset);   // 1/2 of full scale
@@ -726,4 +791,39 @@
       //Ackerman fix
       if (steerAngleActual < 0) steerAngleActual = (steerAngleActual * steerSettings.AckermanFix);     
     }
+  }
+
+  void readADS1115WAS(void)
+  {
+      //get steering position       
+      if (steerConfig.SingleInputWAS)   //Single Input ADS
+      {
+        adc.setMux(ADS1115_REG_CONFIG_MUX_SINGLE_0);        
+        steeringPosition = adc.getConversion();    
+        adc.triggerConversion();//ADS1115 Single Mode   
+        steeringPosition = (steeringPosition >> 1); //bit shift by 2  0 to 13610 is 0 to 5v
+      }    
+      else    //ADS1115 Differential Mode
+      {
+        adc.setMux(ADS1115_REG_CONFIG_MUX_DIFF_0_1);
+        steeringPosition = adc.getConversion();    
+        adc.triggerConversion();      
+        steeringPosition = (steeringPosition >> 1); //bit shift by 2  0 to 13610 is 0 to 5v
+      }
+     
+      //DETERMINE ACTUAL STEERING POSITION
+            
+      if (steerConfig.InvertWAS)
+      {
+          steeringPosition = (steeringPosition - 6805  - steerSettings.wasOffset);   // 1/2 of full scale
+          steerAngleActual = (float)(steeringPosition) / -steerSettings.steerSensorCounts;
+      }
+      else
+      {
+          steeringPosition = (steeringPosition - 6805  + steerSettings.wasOffset);   // 1/2 of full scale
+          steerAngleActual = (float)(steeringPosition) / steerSettings.steerSensorCounts; 
+      }
+        
+      //Ackerman fix
+      if (steerAngleActual < 0) steerAngleActual = (steerAngleActual * steerSettings.AckermanFix);
   }
